@@ -1,8 +1,8 @@
-
 import { NextResponse } from "next/server";
 
+type SourceName = "Jobicy" | "Arbeitnow" | "Remotive";
 type JobicyJob = {
-  id?: number | string;
+  id?: string | number;
   url?: string;
   jobTitle?: string;
   companyName?: string;
@@ -15,35 +15,8 @@ type JobicyJob = {
   salaryCurrency?: string;
   publishedAt?: string | null;
   pubDate?: string | null;
-  source?: string;
+  source?: SourceName;
 };
-
-type RemotiveJob = {
-  id: number;
-  title: string;
-  company_name: string;
-  url: string;
-  description?: string;
-  job_type?: string;
-  publication_date?: string;
-  candidate_required_location?: string;
-  salary?: string;
-};
-
-type ArbeitnowJob = {
-  slug?: string;
-  title?: string;
-  company_name?: string;
-  location?: string;
-  description?: string;
-  url?: string;
-  job_types?: string[];
-  created_at?: number;
-  remote?: boolean;
-};
-
-type SourceName = "Jobicy" | "Arbeitnow" | "Remotive";
-
 type SourceDiagnostic = {
   source: SourceName;
   status: "success" | "empty" | "failed";
@@ -54,7 +27,6 @@ type SourceDiagnostic = {
   duplicates: number;
   error?: string;
 };
-
 type ProcessedJob = {
   id: string;
   title: string;
@@ -73,38 +45,14 @@ type ProcessedJob = {
   eligible: boolean;
   level: string;
   experienceStatus: string;
-  locationCategory:
-    | "Worldwide Remote"
-    | "Region Restricted"
-    | "Location Unclear";
+  locationCategory: "Worldwide Remote" | "Region Restricted" | "Location Unclear";
   isFresh: boolean;
   freshnessStatus: string;
 };
 
-const SOURCE_NAMES: SourceName[] = [
-  "Jobicy",
-  "Arbeitnow",
-  "Remotive",
-];
-
-function createDiagnostic(
-  source: SourceName
-): SourceDiagnostic {
-  return {
-    source,
-    status: "failed",
-    fetched: 0,
-    invalid: 0,
-    filteredOut: 0,
-    matched: 0,
-    duplicates: 0,
-  };
-}
-
-const CANONICAL_SKILLS: {
-  name: string;
-  pattern: RegExp;
-}[] = [
+const SOURCES: SourceName[] = ["Jobicy", "Arbeitnow", "Remotive"];
+const SOURCE_TIMEOUT_MS = 12000;
+const SKILLS = [
   { name: "Next.js", pattern: /\bnext\s*\.?\s*js\b|\bnextjs\b/i },
   { name: "React", pattern: /\breact(?:\.js)?\b/i },
   { name: "Tailwind CSS", pattern: /\btailwind(?:\s+css)?\b/i },
@@ -118,626 +66,245 @@ const CANONICAL_SKILLS: {
   { name: "eCommerce", pattern: /\be[\s-]?commerce\b/i },
 ];
 
-function normalizeText(value: string): string {
-  return value
-    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
-    .replace(/<[^>]*>/g, " ")
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&amp;/gi, "&")
-    .replace(/&hellip;/gi, "...")
-    .replace(/&#39;|&apos;/gi, "'")
-    .replace(/&quot;/gi, '"')
-    .replace(/\s+/g, " ")
-    .trim();
+function diagnostic(source: SourceName): SourceDiagnostic {
+  return { source, status: "failed", fetched: 0, invalid: 0, filteredOut: 0, matched: 0, duplicates: 0 };
 }
-
-function normalizeJobUrl(value?: string): string {
+function record(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown> : {};
+}
+function array(value: unknown): unknown[] { return Array.isArray(value) ? value : []; }
+function text(value: string): string {
+  return value.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]*>/g, " ").replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&").replace(/&hellip;/gi, "...")
+    .replace(/&#39;|&apos;/gi, "'").replace(/&quot;/gi, '"')
+    .replace(/\s+/g, " ").trim();
+}
+function clean(job: JobicyJob, source: SourceName): JobicyJob {
+  return {
+    ...job, jobTitle: job.jobTitle?.trim(),
+    companyName: job.companyName?.trim() || "Company not specified",
+    jobDescription: text(job.jobDescription ?? ""),
+    jobExcerpt: text(job.jobExcerpt ?? ""), source,
+  };
+}
+function normalizeUrl(value?: string): string {
   if (!value) return "";
-
   try {
     const url = new URL(value);
     url.hash = "";
-    url.search = "";
-
+    for (const name of [...url.searchParams.keys()]) {
+      if (/^(utm_|ref$|source$|fbclid$|gclid$)/i.test(name)) url.searchParams.delete(name);
+    }
     return url.href.replace(/\/+$/, "").toLowerCase();
-  } catch {
-    return value.trim().replace(/\/+$/, "").toLowerCase();
-  }
+  } catch { return value.trim().replace(/\/+$/, "").toLowerCase(); }
 }
-
-function getJobKey(job: {
-  url: string;
-  title: string;
-  company: string;
-}): string {
-  const url = normalizeJobUrl(job.url);
-
-  if (url) return `url:${url}`;
-
-  return `job:${job.title.toLowerCase().trim()}|${job.company
-    .toLowerCase()
-    .trim()}`;
+function jobKey(job: ProcessedJob): string {
+  const url = normalizeUrl(job.url);
+  return url ? `url:${url}` : `job:${job.title.toLowerCase().trim()}|${job.company.toLowerCase().trim()}`;
 }
-
-function classifyLocation(
-  job: JobicyJob
-): ProcessedJob["locationCategory"] {
-  const text = [
-    job.jobTitle,
-    job.jobGeo,
-    job.jobExcerpt,
-    job.jobDescription,
-  ]
-    .filter(Boolean)
-    .join(" ")
-    .toLowerCase()
-    .replace(/&hellip;/g, " ");
-
-  const restrictedPatterns = [
-    /\bremote within\s+[a-z\s-]+/i,
-    /\bremote only in\s+[a-z\s-]+/i,
+function locationCategory(job: JobicyJob): ProcessedJob["locationCategory"] {
+  const combined = [job.jobGeo, job.jobTitle, job.jobExcerpt, job.jobDescription].filter(Boolean).join(" ");
+  const restricted = [
+    /\bremote (?:within|only in)\s+[a-z\s-]+/i,
     /\bonly within\s+[a-z\s-]+/i,
-    /\bmust be based in\s+[a-z\s-]+/i,
-    /\bmust reside in\s+[a-z\s-]+/i,
-    /\bremote\s*[-–—]\s*(?:us|usa|uk|canada|poland|australia)\s+only\b/i,
-    /\b(?:100%\s*)?remote within poland\b/i,
+    /\bmust (?:be based|reside) in\s+[a-z\s-]+/i,
+    /\b(?:us|usa|uk|canada|europe|eu|poland|australia)\s+(?:only|residents only)\b/i,
+    /\b(?:only|exclusively) (?:in|for) (?:the )?(?:us|usa|uk|canada|eu|europe)\b/i,
   ];
-
-  if (
-    restrictedPatterns.some((pattern) => pattern.test(text))
-  ) {
-    return "Region Restricted";
-  }
-
-  const worldwidePatterns = [
-    /\bopen to applicants worldwide\b/i,
-    /\bapplicants worldwide\b/i,
-    /\bworldwide applicants\b/i,
-    /\bremote worldwide\b/i,
-    /\bworldwide remote\b/i,
-    /\bremote[\s-]+anywhere in the world\b/i,
-    /\bwork from anywhere in the world\b/i,
-    /\bopen to applicants from any country\b/i,
-    /\bapplicants from all countries\b/i,
+  if (restricted.some(re => re.test(combined))) return "Region Restricted";
+  const global = [
+    /\b(?:remote worldwide|worldwide remote|open to applicants worldwide|applicants worldwide)\b/i,
+    /\b(?:work from|remote from) anywhere(?: in the world)?\b/i,
+    /\b(?:any country|all countries|worldwide)\b/i,
   ];
-
-  if (worldwidePatterns.some((pattern) => pattern.test(text))) {
-    return "Worldwide Remote";
-  }
-
-  return "Location Unclear";
+  return global.some(re => re.test(combined)) ? "Worldwide Remote" : "Location Unclear";
 }
-
-function getJobFreshness(publishedAt?: string | null) {
-  if (!publishedAt) {
-    return {
-      isFresh: false,
-      freshnessStatus: "Date unavailable",
-    };
-  }
-
-  const publishedDate = new Date(publishedAt);
-
-  if (Number.isNaN(publishedDate.getTime())) {
-    return {
-      isFresh: false,
-      freshnessStatus: "Invalid date",
-    };
-  }
-
-  const ageInDays =
-    (Date.now() - publishedDate.getTime()) /
-    (1000 * 60 * 60 * 24);
-
-  if (ageInDays < 0) {
-    return {
-      isFresh: false,
-      freshnessStatus: "Future date — verify",
-    };
-  }
-
-  if (ageInDays <= 7) {
-    return {
-      isFresh: true,
-      freshnessStatus: "Posted within 7 days",
-    };
-  }
-
-  return {
-    isFresh: false,
-    freshnessStatus: "Older than 7 days",
-  };
+function freshness(date?: string | null): Pick<ProcessedJob, "isFresh" | "freshnessStatus"> {
+  if (!date) return { isFresh: false, freshnessStatus: "Date unavailable" };
+  const value = new Date(date).getTime();
+  if (!Number.isFinite(value)) return { isFresh: false, freshnessStatus: "Invalid date" };
+  const days = (Date.now() - value) / 86400000;
+  if (days < -1) return { isFresh: false, freshnessStatus: "Future date — verify" };
+  if (days <= 7) return { isFresh: true, freshnessStatus: "Posted within 7 days" };
+  return { isFresh: false, freshnessStatus: "Older than 7 days" };
 }
-
 function scoreJob(job: JobicyJob) {
   const title = job.jobTitle ?? "";
-  const description = normalizeText(
-    [job.jobExcerpt, job.jobDescription]
-      .filter(Boolean)
-      .join(" ")
-  );
-
-  const fullText = `${title} ${description}`;
-
-  const matchedSkills = CANONICAL_SKILLS
-    .filter((skill) => skill.pattern.test(fullText))
-    .map((skill) => skill.name);
-
-  const seniorTitle =
-    /\b(senior|sr\.?|staff|principal|director|manager|architect|head of|vice president)\b/i.test(
-      title
-    );
-
-  const leadershipTitle =
-    /\b(lead|tech lead|team lead|engineering manager)\b/i.test(
-      title
-    );
-
-  const sentences = description
-    .split(/[.!?\n;]+/)
-    .filter(Boolean);
-
-  const requirementText = sentences
-    .filter((sentence) =>
-      /\b(experience|experienced|years?|yrs?|minimum|required|qualification|qualifications|at least)\b/i.test(
-        sentence
-      )
-    )
-    .join(" ");
-
-  let maxRequiredYears: number | null = null;
-
-  const rangePattern =
-    /(\d+(?:\.\d+)?)\s*(?:-|–|—|to)\s*(\d+(?:\.\d+)?)\s*(?:years?|yrs?)/gi;
-
-  for (const match of requirementText.matchAll(rangePattern)) {
-    const maximum = Number(match[2]);
-
-    if (
-      Number.isFinite(maximum) &&
-      (maxRequiredYears === null || maximum > maxRequiredYears)
-    ) {
-      maxRequiredYears = maximum;
-    }
-  }
-
-  const minimumPatterns = [
+  const description = text([job.jobExcerpt, job.jobDescription].filter(Boolean).join(" "));
+  const matchedSkills = SKILLS.filter(skill => skill.pattern.test(`${title} ${description}`)).map(skill => skill.name);
+  const titleMatches = SKILLS.filter(skill => skill.pattern.test(title));
+  const seniorTitle = /\b(senior|sr\.?|staff|principal|director|manager|architect|head of|vice president)\b/i.test(title);
+  const leadTitle = /\b(lead|tech lead|team lead|engineering manager)\b/i.test(title);
+  const relevantTitle = /\b(developer|engineer|programmer|front[\s-]?end|back[\s-]?end|full[\s-]?stack|react|next\s*\.?\s*js|nextjs|nestjs|api)\b/i.test(title);
+  const entryTitle = /\b(junior|jr\.?|entry[\s-]?level|graduate|trainee|intern|internship)\b/i.test(title);
+  const intermediate = /\b(developer|engineer|programmer)\b/i.test(title);
+  const requirementText = description.split(/[.!?\n;]+/).filter(sentence =>
+    /\b(experience|experienced|years?|yrs?|minimum|required|qualification|at least)\b/i.test(sentence)
+  ).join(" ");
+  const yearsFound: number[] = [];
+  const patterns = [
+    /(\d+(?:\.\d+)?)\s*(?:-|–|—|to)\s*(\d+(?:\.\d+)?)\s*(?:years?|yrs?)/gi,
     /(\d+(?:\.\d+)?)\s*\+\s*(?:years?|yrs?)/gi,
     /\b(?:minimum|min\.?|at least)\s+(?:of\s+)?(\d+(?:\.\d+)?)\s*(?:years?|yrs?)/gi,
+    /(\d+(?:\.\d+)?)\s*(?:years?|yrs?)\s+(?:of\s+)?experience\b/gi,
   ];
-
-  for (const pattern of minimumPatterns) {
+  for (const [index, pattern] of patterns.entries()) {
     for (const match of requirementText.matchAll(pattern)) {
-      const years = Number(match[1]);
-
-      if (
-        Number.isFinite(years) &&
-        (maxRequiredYears === null || years > maxRequiredYears)
-      ) {
-        maxRequiredYears = years;
-      }
+      const candidate = Number(index === 0 ? match[2] : match[1]);
+      if (Number.isFinite(candidate)) yearsFound.push(candidate);
     }
   }
-
-  const experiencePattern =
-    /(\d+(?:\.\d+)?)\s*(?:years?|yrs?)\s+(?:of\s+)?experience\b/gi;
-
-  for (const match of requirementText.matchAll(experiencePattern)) {
-    const years = Number(match[1]);
-
-    if (
-      Number.isFinite(years) &&
-      (maxRequiredYears === null || years > maxRequiredYears)
-    ) {
-      maxRequiredYears = years;
-    }
-  }
-
-  const explicitlyTooExperienced =
-    maxRequiredYears !== null && maxRequiredYears > 2;
-
-  const explicitEntryLevel =
-    /\b(junior|jr\.?|entry[\s-]?level|graduate|trainee|intern|internship)\b/i.test(
-      title
-    );
-
-  const intermediateTitle =
-    /\b(developer|engineer|programmer)\b/i.test(title);
-
-  const relevantTitle =
-    /\b(developer|engineer|programmer|frontend|front[\s-]?end|backend|back[\s-]?end|full[\s-]?stack|react|next\s*\.?\s*js|nextjs|nestjs|api)\b/i.test(
-      title
-    );
-
-  const eligible =
-    relevantTitle &&
-    !seniorTitle &&
-    !leadershipTitle &&
-    !explicitlyTooExperienced;
-
-  const titleMatches = CANONICAL_SKILLS.filter((skill) =>
-    skill.pattern.test(title)
-  );
-
-  let score = 0;
-
-  score += Math.min(titleMatches.length * 15, 45);
-  score += Math.min(matchedSkills.length * 5, 30);
-
-  if (explicitEntryLevel) {
-    score += 20;
-  } else if (intermediateTitle) {
-    score += 10;
-  }
-
-  if (maxRequiredYears !== null && maxRequiredYears <= 2) {
-    score += 10;
-  }
-
-  score = Math.max(0, Math.min(100, score));
-
-  const level = !eligible
-    ? "Excluded"
-    : explicitEntryLevel
-      ? "Entry-Level"
-      : intermediateTitle
-        ? "Potential Intermediate"
-        : "Unclassified";
-
-  const experienceStatus =
-    maxRequiredYears === null
-      ? "Not clearly specified"
-      : maxRequiredYears <= 2
-        ? `Up to ${maxRequiredYears} years detected`
-        : `${maxRequiredYears}+ years may be required`;
-
+  const years = yearsFound.length ? Math.max(...yearsFound) : null;
+  const eligible = relevantTitle && !seniorTitle && !leadTitle && (years === null || years <= 2);
+  let score = Math.min(titleMatches.length * 15, 45) + Math.min(matchedSkills.length * 5, 30);
+  if (entryTitle) score += 20;
+  else if (intermediate) score += 10;
+  if (years !== null && years <= 2) score += 10;
   return {
-    score,
-    matchedSkills,
-    eligible,
-    level,
-    experienceStatus,
+    score: Math.min(100, score), matchedSkills, eligible,
+    level: !eligible ? "Excluded" : entryTitle ? "Entry-Level" : intermediate ? "Potential Intermediate" : "Unclassified",
+    experienceStatus: years === null ? "Not clearly specified" : years <= 2 ? `Up to ${years} years detected` : `${years}+ years may be required`,
   };
 }
-
-function normalizeJob(
-  job: JobicyJob,
-  source: SourceName
-): JobicyJob {
-  return {
-    ...job,
-    jobTitle: job.jobTitle?.trim(),
-    companyName: job.companyName?.trim() || "Company not specified",
-    jobDescription: normalizeText(job.jobDescription ?? ""),
-    jobExcerpt: normalizeText(job.jobExcerpt ?? ""),
-    source,
-  };
-}
-
-function toProcessedJob(job: JobicyJob): ProcessedJob {
-  const {
-    score,
-    matchedSkills,
-    eligible,
-    level,
-    experienceStatus,
-  } = scoreJob(job);
-
-  const locationCategory = classifyLocation(job);
-
+function processJob(job: JobicyJob): ProcessedJob {
   const publishedAt = job.publishedAt ?? job.pubDate ?? null;
-
-  const { isFresh, freshnessStatus } =
-    getJobFreshness(publishedAt);
-
   return {
-    id: String(job.id ?? job.url),
-    title: job.jobTitle ?? "",
+    id: String(job.id ?? job.url ?? ""), title: job.jobTitle ?? "",
     company: job.companyName ?? "Company not specified",
-    location: job.jobGeo ?? "Location not specified",
-    description:
-      job.jobExcerpt ||
-      "Open the original listing for the full description.",
-    url: job.url ?? "",
-    publishedAt,
-    jobType: job.jobType ?? [],
-    salaryMin: job.salaryMin ?? null,
-    salaryMax: job.salaryMax ?? null,
+    location: job.jobGeo || "Location not specified",
+    description: job.jobExcerpt || "Open the original listing for the full description.",
+    url: job.url ?? "", publishedAt, jobType: job.jobType ?? [],
+    salaryMin: job.salaryMin ?? null, salaryMax: job.salaryMax ?? null,
     salaryCurrency: job.salaryCurrency ?? null,
-    score,
-    matchedSkills,
-    source: (job.source ?? "Jobicy") as SourceName,
-    eligible,
-    level,
-    experienceStatus,
-    locationCategory,
-    isFresh,
-    freshnessStatus,
+    source: job.source ?? "Jobicy", locationCategory: locationCategory(job),
+    ...scoreJob(job), ...freshness(publishedAt),
   };
 }
-
-async function fetchJson(
-  url: string,
-  signal: AbortSignal
-): Promise<unknown> {
+async function fetchJson(url: string, requestSignal: AbortSignal): Promise<unknown> {
+  // Each source has its own timeout: a slow source cannot cancel the other two.
+  const signal = AbortSignal.any([requestSignal, AbortSignal.timeout(SOURCE_TIMEOUT_MS)]);
   const response = await fetch(url, {
-    signal,
-    headers: { Accept: "application/json" },
-    cache: "no-store",
+    signal, cache: "no-store", headers: { Accept: "application/json" },
   });
-
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}`);
-  }
-
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
   return response.json();
 }
-
-function asRecord(value: unknown): Record<string, unknown> {
-  return value !== null && typeof value === "object"
-    ? (value as Record<string, unknown>)
-    : {};
-}
-
-function asArray(value: unknown): unknown[] {
-  return Array.isArray(value) ? value : [];
-}
-
-async function fetchJobicy(
-  signal: AbortSignal,
-  diagnostic: SourceDiagnostic
-): Promise<JobicyJob[]> {
-  const url = new URL("https://jobicy.com/api/v2/remote-jobs");
-
-  url.searchParams.set("count", "100");
-  url.searchParams.set("industry", "engineering");
-
+async function collect(source: SourceName, signal: AbortSignal, d: SourceDiagnostic): Promise<JobicyJob[]> {
   try {
-    const raw = await fetchJson(url.toString(), signal);
-    const data = asRecord(raw);
-
-    if (data.success === false || !Array.isArray(data.jobs)) {
-      throw new Error("Unexpected response format from Jobicy");
+    let results: JobicyJob[] = [];
+    if (source === "Jobicy") {
+      // Jobicy's currently documented API endpoint (the older /api/v2/remote-jobs is legacy).
+      const raw = record(await fetchJson("https://jobicy.com/api/jobs?count=100&industry=engineering", signal));
+      if (raw.success === false || !Array.isArray(raw.jobs)) throw new Error("Unexpected Jobicy response format");
+      results = (raw.jobs as JobicyJob[]).map(job => clean(job, source));
+    } else if (source === "Arbeitnow") {
+      const raw = record(await fetchJson("https://www.arbeitnow.com/api/job-board-api", signal));
+      if (!Array.isArray(raw.data)) throw new Error("Unexpected Arbeitnow response format");
+      results = array(raw.data).map(item => {
+        const job = record(item);
+        const description = text(String(job.description ?? ""));
+        return clean({
+          id: `arbeitnow-${String(job.slug ?? job.url ?? "")}`,
+          url: typeof job.url === "string" ? job.url : undefined,
+          jobTitle: typeof job.title === "string" ? job.title : undefined,
+          companyName: typeof job.company_name === "string" ? job.company_name : undefined,
+          jobGeo: typeof job.location === "string" ? job.location : job.remote === true ? "Remote" : "",
+          jobType: Array.isArray(job.job_types) ? job.job_types.filter((v): v is string => typeof v === "string") : [],
+          jobDescription: description, jobExcerpt: description.slice(0, 900),
+          pubDate: typeof job.created_at === "number" ? new Date(job.created_at * 1000).toISOString() : null,
+        }, source);
+      });
+    } else {
+      const raw = record(await fetchJson("https://remotive.com/api/remote-jobs?category=software-dev&limit=200", signal));
+      if (!Array.isArray(raw.jobs)) throw new Error("Unexpected Remotive response format");
+      results = array(raw.jobs).map(item => {
+        const job = record(item);
+        const description = text(String(job.description ?? ""));
+        return clean({
+          id: `remotive-${String(job.id ?? "")}`,
+          url: typeof job.url === "string" ? job.url : undefined,
+          jobTitle: typeof job.title === "string" ? job.title : undefined,
+          companyName: typeof job.company_name === "string" ? job.company_name : undefined,
+          jobGeo: typeof job.candidate_required_location === "string" ? job.candidate_required_location : "Remote",
+          jobType: typeof job.job_type === "string" ? [job.job_type] : [],
+          jobDescription: description, jobExcerpt: description.slice(0, 1200),
+          pubDate: typeof job.publication_date === "string" ? job.publication_date : null,
+        }, source);
+      });
     }
-
-    const items = data.jobs as JobicyJob[];
-
-    diagnostic.fetched = items.length;
-    diagnostic.status = items.length > 0 ? "success" : "empty";
-
-    return items.map((job) => normalizeJob(job, "Jobicy"));
+    d.fetched = results.length;
+    d.status = results.length ? "success" : "empty";
+    return results;
   } catch (error) {
-    if (signal.aborted) throw error;
-
-    diagnostic.status = "failed";
-    diagnostic.error =
-      error instanceof Error ? error.message : "Request failed";
-
-    return [];
-  }
-}
-
-async function fetchArbeitnow(
-  signal: AbortSignal,
-  diagnostic: SourceDiagnostic
-): Promise<JobicyJob[]> {
-  try {
-    const raw = await fetchJson(
-      "https://www.arbeitnow.com/api/job-board-api",
-      signal
-    );
-
-    const data = asRecord(raw);
-    const items = asArray(data.data) as ArbeitnowJob[];
-
-    diagnostic.fetched = items.length;
-    diagnostic.status = items.length > 0 ? "success" : "empty";
-
-    return items.map((job) => {
-      const description = normalizeText(job.description ?? "");
-
-      return normalizeJob(
-        {
-          id: `arbeitnow-${job.slug ?? job.url ?? ""}`,
-          url: job.url,
-          jobTitle: job.title,
-          companyName: job.company_name ?? "Company not specified",
-          jobGeo: job.location ?? (job.remote ? "Remote" : ""),
-          jobType: job.job_types ?? [],
-          jobDescription: description,
-          jobExcerpt: description.slice(0, 900),
-          pubDate:
-            typeof job.created_at === "number"
-              ? new Date(job.created_at * 1000).toISOString()
-              : null,
-        },
-        "Arbeitnow"
-      );
-    });
-  } catch (error) {
-    if (signal.aborted) throw error;
-
-    diagnostic.status = "failed";
-    diagnostic.error =
-      error instanceof Error ? error.message : "Request failed";
-
-    return [];
-  }
-}
-
-async function fetchRemotive(
-  signal: AbortSignal,
-  diagnostic: SourceDiagnostic
-): Promise<JobicyJob[]> {
-  const url = new URL("https://remotive.com/api/remote-jobs");
-
-  url.searchParams.set("category", "software-dev");
-  url.searchParams.set("limit", "200");
-
-  try {
-    const raw = await fetchJson(url.toString(), signal);
-    const data = asRecord(raw);
-    const items = asArray(data.jobs) as RemotiveJob[];
-
-    diagnostic.fetched = items.length;
-    diagnostic.status = items.length > 0 ? "success" : "empty";
-
-    return items.map((job) => {
-      const description = normalizeText(job.description ?? "");
-      const location = job.candidate_required_location ?? "";
-
-      return normalizeJob(
-        {
-          id: `remotive-${job.id}`,
-          url: job.url,
-          jobTitle: job.title,
-          companyName: job.company_name || "Company not specified",
-          jobGeo: /worldwide/i.test(location)
-            ? "Remote worldwide"
-            : location || "Remote",
-          jobType: job.job_type ? [job.job_type] : [],
-          jobDescription: description,
-          jobExcerpt: description.slice(0, 1200),
-          pubDate: job.publication_date ?? null,
-        },
-        "Remotive"
-      );
-    });
-  } catch (error) {
-    if (signal.aborted) throw error;
-
-    diagnostic.status = "failed";
-    diagnostic.error =
-      error instanceof Error ? error.message : "Request failed";
-
+    d.status = "failed";
+    d.error = error instanceof Error
+      ? error.name === "TimeoutError" ? "Source timed out after 12 seconds" : error.message
+      : "Request failed";
     return [];
   }
 }
 
 export async function GET(request: Request) {
-  const diagnostics = Object.fromEntries(
-    SOURCE_NAMES.map((source) => [
-      source,
-      createDiagnostic(source),
-    ])
-  ) as Record<SourceName, SourceDiagnostic>;
-
+  const diagnostics = Object.fromEntries(SOURCES.map(source => [source, diagnostic(source)])) as Record<SourceName, SourceDiagnostic>;
   try {
-    const timeoutSignal = AbortSignal.timeout(25000);
-
-    const signal = AbortSignal.any([
-      request.signal,
-      timeoutSignal,
-    ]);
-
-    const sourceResults = await Promise.all([
-      fetchJobicy(signal, diagnostics.Jobicy),
-      fetchArbeitnow(signal, diagnostics.Arbeitnow),
-      fetchRemotive(signal, diagnostics.Remotive),
-    ]);
-
-    if (request.signal.aborted) {
-      return NextResponse.json(
-        { success: false, error: "Scan cancelled" },
-        { status: 408 }
-      );
-    }
-
-    const sourceJobs: JobicyJob[] = sourceResults.flat();
-
-    const processedBySource: Record<SourceName, ProcessedJob[]> = {
-      Jobicy: [],
-      Arbeitnow: [],
-      Remotive: [],
-    };
-
-    for (const job of sourceJobs) {
-      const source = job.source as SourceName;
-
+    const sourceResults = await Promise.all(SOURCES.map(source => collect(source, request.signal, diagnostics[source])));
+    if (request.signal.aborted) return NextResponse.json({ success: false, error: "Scan cancelled" }, { status: 408 });
+    const groups: Record<SourceName, ProcessedJob[]> = { Jobicy: [], Arbeitnow: [], Remotive: [] };
+    for (const job of sourceResults.flat()) {
+      const source = job.source ?? "Jobicy";
       if (!job.jobTitle?.trim() || !job.url?.trim()) {
         diagnostics[source].invalid++;
         continue;
       }
-
-      const processed = toProcessedJob(job);
-
-      const passesFilters =
-        processed.eligible &&
-        processed.score >= 20 &&
-        processed.isFresh &&
-        processed.locationCategory !== "Region Restricted";
-
-      if (!passesFilters) {
-        diagnostics[source].filteredOut++;
-        continue;
-      }
-
-      processedBySource[source].push(processed);
-    }
-
-    // Process in a fixed order so cross-source duplicates
-    // are attributed consistently to the later source.
-    const uniqueJobs: ProcessedJob[] = [];
-    const seenKeys = new Set<string>();
-
-    for (const source of SOURCE_NAMES) {
-      const candidates = processedBySource[source];
-
-      for (const job of candidates) {
-        const key = getJobKey(job);
-
-        if (seenKeys.has(key)) {
-          diagnostics[source].duplicates++;
-          continue;
-        }
-
-        seenKeys.add(key);
-        uniqueJobs.push(job);
-        diagnostics[source].matched++;
+      try {
+        const processed = processJob(job);
+        const qualifies = processed.eligible && processed.score >= 20 && processed.isFresh && processed.locationCategory !== "Region Restricted";
+        if (qualifies) groups[source].push(processed);
+        else diagnostics[source].filteredOut++;
+      } catch (error) {
+        diagnostics[source].invalid++;
+        console.warn(`Invalid ${source} job record:`, error);
       }
     }
-
-    uniqueJobs.sort((a, b) => b.score - a.score);
-
+    const jobs: ProcessedJob[] = [];
+    const seen = new Set<string>();
+    for (const source of SOURCES) {
+      for (const job of groups[source]) {
+        const key = jobKey(job);
+        if (seen.has(key)) diagnostics[source].duplicates++;
+        else { seen.add(key); jobs.push(job); diagnostics[source].matched++; }
+      }
+    }
+    jobs.sort((a, b) => b.score - a.score);
+    const failed = SOURCES.filter(source => diagnostics[source].status === "failed");
+    if (failed.length === SOURCES.length) {
+      return NextResponse.json({
+        success: false,
+        error: "All job sources failed. Check sourceDiagnostics for the individual API errors.",
+        sourceDiagnostics: SOURCES.map(source => diagnostics[source]),
+      }, { status: 503 });
+    }
     return NextResponse.json({
       success: true,
       source: "Jobicy, Arbeitnow, Remotive",
       fetchedAt: new Date().toISOString(),
-      totalFetched: SOURCE_NAMES.reduce(
-        (sum, source) => sum + diagnostics[source].fetched,
-        0
-      ),
-      matchedCount: uniqueJobs.length,
-      sourceDiagnostics: SOURCE_NAMES.map(
-        (source) => diagnostics[source]
-      ),
-      jobs: uniqueJobs,
-      note:
-        "Filtered-out counts include invalid records separately. " +
-        "Duplicates are counted among jobs that pass the filters. " +
-        "A matched job is a unique listing that passes all filters.",
+      totalFetched: SOURCES.reduce((sum, source) => sum + diagnostics[source].fetched, 0),
+      matchedCount: jobs.length,
+      sourceDiagnostics: SOURCES.map(source => diagnostics[source]),
+      jobs,
+      note: failed.length
+        ? `Partial scan: ${failed.join(", ")} could not be fetched. Other sources were processed.`
+        : "All sources responded. Listings filtered by skills, experience, freshness and geographic restrictions.",
     });
   } catch (error) {
-    if (request.signal.aborted) {
-      return NextResponse.json(
-        { success: false, error: "Scan cancelled" },
-        { status: 408 }
-      );
-    }
-
-    console.error("Job scan failed:", error);
-
-    return NextResponse.json(
-      {
-        success: false,
-        error:
-          "Unable to complete job scan. Check your connection and try again.",
-        sourceDiagnostics: SOURCE_NAMES.map(
-          (source) => diagnostics[source]
-        ),
-      },
-      { status: 500 }
-    );
+    console.error("Unexpected job scan error:", error);
+    return NextResponse.json({
+      success: false,
+      error: error instanceof Error ? error.message : "Unexpected job scan error",
+      sourceDiagnostics: SOURCES.map(source => diagnostics[source]),
+    }, { status: 500 });
   }
 }
